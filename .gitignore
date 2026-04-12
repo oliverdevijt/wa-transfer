@@ -1,0 +1,11 @@
+node_modules/
+dist/
+release/
+*.ab
+*.crypt15
+*.crypt14
+*.crypt12
+key
+wa_extracted/
+*.log
+.env
