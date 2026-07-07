@@ -42,6 +42,13 @@ function adbBin() {
   return p.includes(' ') ? `"${p}"` : p;
 }
 
+// message_media.file_path is already relative to the account's WhatsApp media
+// root, e.g. "Media/WhatsApp Images/IMG-20220826-WA0000.jpg" — confirmed this
+// session by comparing real file_path values against `adb shell ls` output.
+function buildMediaRemotePath(appId, relativeFilePath) {
+  return `/sdcard/Android/media/${appId}/Whatsapp/${relativeFilePath}`;
+}
+
 class AdbModule {
   constructor() {
     this.client = new AdbClient({ port: 5037, bin: resolveAdbPath() });
@@ -371,6 +378,43 @@ class AdbModule {
   }
 
   /**
+   * Pulls only the media files actually referenced by in-scope messages —
+   * not the whole Media/ tree, which also holds AI Media/wallpapers/bug
+   * report attachments we don't want.
+   */
+  async pullMediaFiles(serial, appId, referencedPaths, outputDir, onProgress) {
+    logger.info(`Pulling ${referencedPaths.length} media file(s) for ${appId} on ${serial}`);
+    const pulled = [];
+    const missing = [];
+
+    for (let i = 0; i < referencedPaths.length; i++) {
+      const relPath = referencedPaths[i];
+      const remotePath = buildMediaRemotePath(appId, relPath);
+      const localPath = path.join(outputDir, relPath);
+      fs.mkdirSync(path.dirname(localPath), { recursive: true });
+
+      try {
+        await execAsync(`${adbBin()} -s ${serial} pull "${remotePath}" "${localPath}"`, { timeout: 30000 });
+        if (fs.existsSync(localPath)) {
+          pulled.push(relPath);
+        } else {
+          missing.push(relPath);
+        }
+      } catch (e) {
+        logger.warn(`Media pull failed for ${relPath}: ${e.message}`);
+        missing.push(relPath);
+      }
+
+      if (onProgress && i % 20 === 0) {
+        onProgress({ percent: Math.floor((i / referencedPaths.length) * 100), message: `Pulling media (${i}/${referencedPaths.length})...` });
+      }
+    }
+
+    logger.info(`Media pull complete: ${pulled.length} pulled, ${missing.length} missing`);
+    return { pulled, missing };
+  }
+
+  /**
    * Run adb backup for the given app. User must confirm on device.
    */
   async startBackup(serial, appId, outputDir, onProgress) {
@@ -416,4 +460,4 @@ class AdbModule {
   }
 }
 
-module.exports = { AdbModule };
+module.exports = { AdbModule, buildMediaRemotePath };
