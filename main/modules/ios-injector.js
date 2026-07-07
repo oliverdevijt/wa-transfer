@@ -1,6 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const Database = require('better-sqlite3');
 const { createLogger } = require('../utils/logger');
 
 const logger = createLogger('ios-injector');
@@ -58,7 +59,6 @@ function checkHasWhatsApp(backupId) {
   if (!fs.existsSync(manifestPath)) return false;
 
   try {
-    const Database = require('better-sqlite3');
     const db = new Database(manifestPath, { readonly: true });
     const row = db.prepare(
       `SELECT fileID FROM Files WHERE domain LIKE '%whatsapp%' LIMIT 1`
@@ -75,9 +75,11 @@ function getBackupPath(backupId) {
 }
 
 function getWhatsAppDbPath(backupId, isBusinessApp) {
+  // Modern WhatsApp iOS stores ChatStorage.sqlite in its App Group's shared container,
+  // not the app's own private AppDomain (which no longer holds the live chat DB).
   const domain = isBusinessApp
-    ? 'AppDomain-net.WhatsApp.WhatsApp4B'
-    : 'AppDomain-net.whatsapp.WhatsApp';
+    ? 'AppDomainGroup-group.net.whatsapp.WhatsAppSMB.shared'
+    : 'AppDomainGroup-group.net.whatsapp.WhatsApp.shared';
 
   const manifestPath = path.join(BACKUP_BASE, backupId, 'Manifest.db');
   const db = new Database(manifestPath, { readonly: true });

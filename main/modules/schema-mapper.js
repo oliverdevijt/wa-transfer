@@ -15,14 +15,6 @@ function unixMsToAppleTime(unixMs) {
   return (unixMs / 1000) - APPLE_EPOCH_OFFSET;
 }
 
-function mimeToCategory(mime) {
-  if (!mime) return 0;
-  if (mime.startsWith('image/')) return 1;
-  if (mime.startsWith('audio/')) return 2;
-  if (mime.startsWith('video/')) return 3;
-  return 0;
-}
-
 async function mergeSchemas(androidDbPath, iosBackupId, includeMedia, onProgress) {
   logger.info(`Starting schema merge: ${androidDbPath} → backup ${iosBackupId}`);
 
@@ -83,10 +75,13 @@ async function mergeSchemas(androidDbPath, iosBackupId, includeMedia, onProgress
     onProgress({ percent: 30, currentChat: 'Inserting chat sessions...', done: false });
 
     // Insert messages in batches
+    // Note: modern ZWAMESSAGE has no ZMEDIACATEGORY column — media is represented via a
+    // separate ZWAMEDIAITEM row (linked through ZMEDIAITEM) plus ZMESSAGETYPE, which this
+    // basic port doesn't populate yet, so media messages come through as text-only stubs.
     const insertMsg = iosDb.prepare(`
       INSERT OR IGNORE INTO ZWAMESSAGE
-        (Z_PK, ZCHATSESSION, ZISFROMME, ZMESSAGEDATE, ZTEXT, ZMESSAGESTATUS, ZMEDIACATEGORY, ZGROUPMEMBER)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        (Z_PK, ZCHATSESSION, ZISFROMME, ZMESSAGEDATE, ZTEXT, ZMESSAGESTATUS, ZGROUPMEMBER)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
     `);
 
     const batchSize = 500;
@@ -107,7 +102,6 @@ async function mergeSchemas(androidDbPath, iosBackupId, includeMedia, onProgress
             unixMsToAppleTime(msg.timestamp),
             msg.data || null,
             msg.status || 0,
-            mimeToCategory(msg.media_mime_type),
             msg.remote_resource || null
           );
         } catch (e) {
