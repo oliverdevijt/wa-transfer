@@ -9,6 +9,7 @@
     "build": "vite build",
     "package": "npm run build && electron-builder",
     "lint": "eslint main/ renderer/",
+    "test": "node --test main/**/*.test.js",
     "postinstall": "electron-builder install-app-deps"
   },
   "dependencies": {
