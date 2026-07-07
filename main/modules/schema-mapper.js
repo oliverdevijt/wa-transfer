@@ -3,6 +3,7 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const { getWhatsAppDbPath, getBackupPath } = require('./ios-injector');
+const { queryMessages, queryChats } = require('./android-parser');
 const { createLogger } = require('../utils/logger');
 
 const logger = createLogger('schema-mapper');
@@ -35,8 +36,8 @@ async function mergeSchemas(androidDbPath, iosBackupId, includeMedia, onProgress
   const iosDb = new Database(tmpIosDb);
 
   try {
-    const chats = androidDb.prepare('SELECT * FROM chat_list').all();
-    const messages = androidDb.prepare('SELECT * FROM messages ORDER BY timestamp ASC').all();
+    const chats = queryChats(androidDb);
+    const messages = queryMessages(androidDb);
 
     onProgress({ percent: 10, currentChat: 'Reading Android data...', done: false });
 

@@ -1,6 +1,7 @@
 const { Client: AdbClient } = require('adb-ts');
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 const { exec } = require('child_process');
 const { promisify } = require('util');
 const execAsync = promisify(exec);
@@ -8,9 +9,42 @@ const { createLogger } = require('../utils/logger');
 
 const logger = createLogger('adb');
 
+let cachedAdbPath = null;
+
+// Resolves a usable adb binary even when it's not on PATH (common when Electron
+// is launched from Explorer/a shortcut rather than a shell with platform-tools on PATH).
+function resolveAdbPath() {
+  if (cachedAdbPath) return cachedAdbPath;
+
+  const exeName = process.platform === 'win32' ? 'adb.exe' : 'adb';
+  const candidates = [];
+
+  for (const root of [process.env.ANDROID_HOME, process.env.ANDROID_SDK_ROOT]) {
+    if (root) candidates.push(path.join(root, 'platform-tools', exeName));
+  }
+
+  if (process.platform === 'win32') {
+    candidates.push(path.join(os.homedir(), 'AppData', 'Local', 'Android', 'Sdk', 'platform-tools', exeName));
+  } else if (process.platform === 'darwin') {
+    candidates.push(path.join(os.homedir(), 'Library', 'Android', 'sdk', 'platform-tools', exeName));
+  } else {
+    candidates.push(path.join(os.homedir(), 'Android', 'Sdk', 'platform-tools', exeName));
+  }
+
+  const found = candidates.find((c) => fs.existsSync(c));
+  cachedAdbPath = found || 'adb';
+  logger.info(found ? `Resolved adb path: ${found}` : 'adb not found via known SDK paths, falling back to PATH lookup');
+  return cachedAdbPath;
+}
+
+function adbBin() {
+  const p = resolveAdbPath();
+  return p.includes(' ') ? `"${p}"` : p;
+}
+
 class AdbModule {
   constructor() {
-    this.client = new AdbClient({ port: 5037 });
+    this.client = new AdbClient({ port: 5037, bin: resolveAdbPath() });
   }
 
   async scanDevices() {
@@ -60,7 +94,7 @@ class AdbModule {
     // Step 1: Uninstall current version but KEEP app data
     onProgress({ percent: 5, message: `Uninstalling current ${appId} (keeping data)...` });
     try {
-      const r = await execAsync(`adb -s ${serial} uninstall -k ${appId}`, { timeout: 30000 });
+      const r = await execAsync(`${adbBin()} -s ${serial} uninstall -k ${appId}`, { timeout: 30000 });
       logger.info(`Uninstall result: ${r.stdout}`);
     } catch (e) {
       logger.info(`Uninstall skipped: ${e.message}`);
@@ -69,7 +103,7 @@ class AdbModule {
     // Method A: adb install (works on Android ≤ 11 after uninstall -k)
     onProgress({ percent: 12, message: 'Installing legacy APK...' });
     try {
-      const r = await execAsync(`adb -s ${serial} install "${apkPath}"`, { timeout: 120000 });
+      const r = await execAsync(`${adbBin()} -s ${serial} install "${apkPath}"`, { timeout: 120000 });
       if (!r.stdout.includes('FAILED') && !r.stderr.includes('FAILED')) {
         onProgress({ percent: 20, message: 'Legacy APK installed successfully.' });
         logger.info('APK installed via method A');
@@ -83,12 +117,12 @@ class AdbModule {
     onProgress({ percent: 15, message: 'Trying alternative install method...' });
     const remotePath = `/data/local/tmp/wa_legacy.apk`;
     try {
-      await execAsync(`adb -s ${serial} push "${apkPath}" ${remotePath}`, { timeout: 60000 });
+      await execAsync(`${adbBin()} -s ${serial} push "${apkPath}" ${remotePath}`, { timeout: 60000 });
       const r = await execAsync(
-        `adb -s ${serial} shell pm install --allow-downgrade -r -t "${remotePath}"`,
+        `${adbBin()} -s ${serial} shell pm install --allow-downgrade -r -t "${remotePath}"`,
         { timeout: 120000 }
       );
-      await execAsync(`adb -s ${serial} shell rm "${remotePath}"`).catch(() => {});
+      await execAsync(`${adbBin()} -s ${serial} shell rm "${remotePath}"`).catch(() => {});
 
       if (r.stdout.includes('Success') || r.stderr.includes('Success')) {
         onProgress({ percent: 20, message: 'Legacy APK installed (method B).' });
@@ -98,7 +132,7 @@ class AdbModule {
       throw new Error(r.stdout || r.stderr);
     } catch (e) {
       logger.warn(`Method B failed: ${e.message}`);
-      await execAsync(`adb -s ${serial} shell rm "${remotePath}"`).catch(() => {});
+      await execAsync(`${adbBin()} -s ${serial} shell rm "${remotePath}"`).catch(() => {});
     }
 
     // Both methods failed — Android 12+ rollback protection
@@ -125,7 +159,7 @@ class AdbModule {
     const isWAB = appId.includes('w4b');
     const mediaBase = isWAB
       ? `/sdcard/Android/media/com.whatsapp.w4b/WhatsApp Business/Databases`
-      : `/sdcard/Android/media/com.whatsapp/WhatsApp/Databases`;
+      : `/sdcard/Android/media/com.whatsapp/Whatsapp/Databases`;
 
     // ── Step 1: Pull crypt15 from external storage ───────────────────────
     onProgress({ percent: 10, message: 'Scanning WhatsApp database folder...' });
@@ -136,9 +170,12 @@ class AdbModule {
     for (const ext of ['crypt15', 'crypt14', 'crypt12']) {
       const candidate = `${mediaBase}/msgstore.db.${ext}`;
       try {
-        const r = await execAsync(`adb -s ${serial} shell "ls '${candidate}' 2>/dev/null && echo OK"`, { timeout: 8000 });
+        const r = await execAsync(`${adbBin()} -s ${serial} shell "ls '${candidate}' 2>/dev/null && echo OK"`, { timeout: 8000 });
+        logger.info(`Checked ${candidate}: stdout="${r.stdout.trim()}" stderr="${r.stderr.trim()}"`);
         if (r.stdout.includes('OK')) { remoteCrypt = candidate; break; }
-      } catch (_) {}
+      } catch (e) {
+        logger.warn(`Check failed for ${candidate}: ${e.message}`);
+      }
     }
 
     if (!remoteCrypt) {
@@ -150,7 +187,7 @@ class AdbModule {
 
     onProgress({ percent: 20, message: `Pulling ${path.basename(remoteCrypt)}...` });
     localCrypt = path.join(outputDir, 'msgstore.db.' + remoteCrypt.split('.').pop());
-    await execAsync(`adb -s ${serial} pull "${remoteCrypt}" "${localCrypt}"`, { timeout: 120000 });
+    await execAsync(`${adbBin()} -s ${serial} pull "${remoteCrypt}" "${localCrypt}"`, { timeout: 120000 });
 
     if (!fs.existsSync(localCrypt)) throw new Error('Failed to pull database file.');
     logger.info(`Crypt pulled: ${localCrypt} (${fs.statSync(localCrypt).size} bytes)`);
@@ -162,21 +199,21 @@ class AdbModule {
     try {
       const tmpKey = `/sdcard/wa_key_tmp_${Date.now()}`;
       const r = await execAsync(
-        `adb -s ${serial} shell "run-as ${appId} cp /data/data/${appId}/files/key /sdcard/ 2>&1 && echo COPIED"`,
+        `${adbBin()} -s ${serial} shell "run-as ${appId} cp /data/data/${appId}/files/key /sdcard/ 2>&1 && echo COPIED"`,
         { timeout: 10000 }
       );
       if (r.stdout.includes('COPIED') || r.stderr.includes('COPIED')) {
-        await execAsync(`adb -s ${serial} pull /sdcard/key "${localKey}"`, { timeout: 10000 });
-        await execAsync(`adb -s ${serial} shell "rm /sdcard/key"`).catch(() => {});
+        await execAsync(`${adbBin()} -s ${serial} pull /sdcard/key "${localKey}"`, { timeout: 10000 });
+        await execAsync(`${adbBin()} -s ${serial} shell "rm /sdcard/key"`).catch(() => {});
       } else {
         // Try alternate path
         const r2 = await execAsync(
-          `adb -s ${serial} shell "run-as ${appId} sh -c 'cat /data/data/${appId}/files/key' > /sdcard/wa_key_tmp && echo DONE"`,
+          `${adbBin()} -s ${serial} shell "run-as ${appId} sh -c 'cat /data/data/${appId}/files/key' > /sdcard/wa_key_tmp && echo DONE"`,
           { timeout: 10000 }
         );
         if (r2.stdout.includes('DONE')) {
-          await execAsync(`adb -s ${serial} pull /sdcard/wa_key_tmp "${localKey}"`, { timeout: 10000 });
-          await execAsync(`adb -s ${serial} shell "rm /sdcard/wa_key_tmp"`).catch(() => {});
+          await execAsync(`${adbBin()} -s ${serial} pull /sdcard/wa_key_tmp "${localKey}"`, { timeout: 10000 });
+          await execAsync(`${adbBin()} -s ${serial} shell "rm /sdcard/wa_key_tmp"`).catch(() => {});
         }
       }
     } catch (e) {
@@ -194,11 +231,11 @@ class AdbModule {
     try {
       const tmpKey = `/sdcard/wa_cpkey_${Date.now()}`;
       await execAsync(
-        `adb -s ${serial} shell "cp /data/data/${appId}/files/key ${tmpKey} 2>/dev/null && chmod 644 ${tmpKey}"`,
+        `${adbBin()} -s ${serial} shell "cp /data/data/${appId}/files/key ${tmpKey} 2>/dev/null && chmod 644 ${tmpKey}"`,
         { timeout: 8000 }
       );
-      await execAsync(`adb -s ${serial} pull "${tmpKey}" "${localKey}"`, { timeout: 10000 });
-      await execAsync(`adb -s ${serial} shell "rm ${tmpKey}"`).catch(() => {});
+      await execAsync(`${adbBin()} -s ${serial} pull "${tmpKey}" "${localKey}"`, { timeout: 10000 });
+      await execAsync(`${adbBin()} -s ${serial} shell "rm ${tmpKey}"`).catch(() => {});
 
       if (fs.existsSync(localKey) && fs.statSync(localKey).size >= 30) {
         logger.info('Key obtained via shell cp (permissive shell)');
@@ -220,7 +257,7 @@ class AdbModule {
    */
   async checkRoot(serial) {
     try {
-      const r = await execAsync(`adb -s ${serial} shell "su -c 'echo root_ok'"`, { timeout: 10000 });
+      const r = await execAsync(`${adbBin()} -s ${serial} shell "su -c 'echo root_ok'"`, { timeout: 10000 });
       const ok = r.stdout.trim().includes('root_ok') || r.stderr.trim().includes('root_ok');
       logger.info(`Root check on ${serial}: ${ok ? 'ROOTED' : 'NOT ROOTED'}`);
       return ok;
@@ -244,14 +281,14 @@ class AdbModule {
     // Determine crypt15 path based on app type
     const mediaDir = appId.includes('w4b')
       ? `/sdcard/Android/media/com.whatsapp.w4b/WhatsApp Business/Databases`
-      : `/sdcard/Android/media/com.whatsapp/WhatsApp/Databases`;
+      : `/sdcard/Android/media/com.whatsapp/Whatsapp/Databases`;
 
     // Step 1: Copy key to readable location using su
     onProgress({ percent: 10, message: 'Requesting root access to pull encryption key...' });
     const tmpKey = `/data/local/tmp/wa_key_${Date.now()}`;
     try {
       const r = await execAsync(
-        `adb -s ${serial} shell "su -c 'cp ${keyRemote} ${tmpKey} && chmod 644 ${tmpKey}'"`,
+        `${adbBin()} -s ${serial} shell "su -c 'cp ${keyRemote} ${tmpKey} && chmod 644 ${tmpKey}'"`,
         { timeout: 15000 }
       );
       if (r.stderr && r.stderr.includes('Permission denied')) {
@@ -262,8 +299,8 @@ class AdbModule {
     }
 
     onProgress({ percent: 25, message: 'Pulling encryption key...' });
-    await execAsync(`adb -s ${serial} pull "${tmpKey}" "${keyLocal}"`, { timeout: 15000 });
-    await execAsync(`adb -s ${serial} shell "rm ${tmpKey}"`).catch(() => {});
+    await execAsync(`${adbBin()} -s ${serial} pull "${tmpKey}" "${keyLocal}"`, { timeout: 15000 });
+    await execAsync(`${adbBin()} -s ${serial} shell "rm ${tmpKey}"`).catch(() => {});
 
     if (!fs.existsSync(keyLocal) || fs.statSync(keyLocal).size < 30) {
       throw new Error('Key file pull failed or file is too small.');
@@ -279,7 +316,7 @@ class AdbModule {
     const cryptLocal = path.join(outputDir, 'msgstore.db.crypt15');
 
     try {
-      const lsResult = await execAsync(`adb -s ${serial} shell "ls '${mediaDir}'"`, { timeout: 10000 });
+      const lsResult = await execAsync(`${adbBin()} -s ${serial} shell "ls '${mediaDir}'"`, { timeout: 10000 });
       if (lsResult.stdout.includes('msgstore.db.crypt15')) {
         cryptFile = cryptRemote;
       } else if (lsResult.stdout.includes('msgstore.db.crypt14')) {
@@ -298,12 +335,12 @@ class AdbModule {
       const tmpDb = `/data/local/tmp/wa_msgstore_${Date.now()}`;
       try {
         await execAsync(
-          `adb -s ${serial} shell "su -c 'cp ${internalDb} ${tmpDb} && chmod 644 ${tmpDb}'"`,
+          `${adbBin()} -s ${serial} shell "su -c 'cp ${internalDb} ${tmpDb} && chmod 644 ${tmpDb}'"`,
           { timeout: 15000 }
         );
         const dbLocal = path.join(outputDir, 'msgstore.db');
-        await execAsync(`adb -s ${serial} pull "${tmpDb}" "${dbLocal}"`, { timeout: 60000 });
-        await execAsync(`adb -s ${serial} shell "rm ${tmpDb}"`).catch(() => {});
+        await execAsync(`${adbBin()} -s ${serial} pull "${tmpDb}" "${dbLocal}"`, { timeout: 60000 });
+        await execAsync(`${adbBin()} -s ${serial} shell "rm ${tmpDb}"`).catch(() => {});
 
         // Validate it's a SQLite file
         const magic = fs.readFileSync(dbLocal).slice(0, 15).toString('utf8');
@@ -322,7 +359,7 @@ class AdbModule {
 
     // Step 3: Pull the crypt file
     onProgress({ percent: 55, message: `Pulling encrypted database (${path.basename(cryptFile)})...` });
-    await execAsync(`adb -s ${serial} pull "${cryptFile}" "${cryptLocal}"`, { timeout: 120000 });
+    await execAsync(`${adbBin()} -s ${serial} pull "${cryptFile}" "${cryptLocal}"`, { timeout: 120000 });
 
     if (!fs.existsSync(cryptLocal)) {
       throw new Error('Failed to pull encrypted database file.');
@@ -347,7 +384,7 @@ class AdbModule {
 
     // adb backup -nowapk: don't include the APK itself, just data
     await execAsync(
-      `adb -s ${serial} backup -nowapk -noshared ${appId} -f "${backupFile}"`,
+      `${adbBin()} -s ${serial} backup -nowapk -noshared ${appId} -f "${backupFile}"`,
       { timeout: 300000 }
     );
 
